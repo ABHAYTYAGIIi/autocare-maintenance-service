@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autocare-maintenance-service
+  namespace: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: autocare-maintenance-service
+  template:
+    metadata:
+      labels:
+        app: autocare-maintenance-service
+    spec:
+      containers:
+        - name: maintenance-service
+          image: acrazureproject.azurecr.io/autocare-maintenance-service:v1
+          ports:
+            - containerPort: 8001
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 20
