@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: autocare-maintenance-service
-  namespace: dev
 spec:
   replicas: 1
   selector:
@@ -15,7 +14,8 @@ spec:
     spec:
       containers:
         - name: maintenance-service
-          image: acrazureproject.azurecr.io/autocare-maintenance-service:v1
+          image: acrazureproject.azurecr.io/autocare-maintenance-service
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
           readinessProbe:
