@@ -1,0 +1,276 @@
+name: AutoCare Maintenance CI/CD
+
+on:
+  push:
+    branches:
+      - dev
+      - uat
+      - main
+
+  pull_request:
+    branches:
+      - dev
+      - uat
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACR_LOGIN_SERVER: acrazureproject.azurecr.io
+  ACR_NAME: acrazureproject
+  IMAGE_NAME: autocare-maintenance-service
+  AZURE_RESOURCE_GROUP: rg-azure-aks
+  AKS_CLUSTER_NAME: aks-azure-project
+
+jobs:
+
+  # ============================================================
+  # STAGE 1 - VALIDATE
+  # ============================================================
+  validate:
+    name: Stage 1 - Validate
+    runs-on: autocare-maintenance
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Python
+        run: |
+          python -m compileall app
+
+      - name: Verify FastAPI application
+        run: |
+          python -c "from app.main import app; print(app.title)"
+
+
+  # ============================================================
+  # STAGE 2 - KUBERNETES VALIDATION
+  # ============================================================
+  k8s-validation:
+    name: Stage 2 - Kubernetes Validation
+    needs: validate
+    runs-on: autocare-maintenance
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate DEV Kustomize overlay
+        run: |
+          kubectl kustomize k8s/overlays/dev > /tmp/maintenance-dev.yaml
+
+      - name: Validate UAT Kustomize overlay
+        run: |
+          kubectl kustomize k8s/overlays/uat > /tmp/maintenance-uat.yaml
+
+      - name: Validate PROD Kustomize overlay
+        run: |
+          kubectl kustomize k8s/overlays/prod > /tmp/maintenance-prod.yaml
+
+      - name: Verify Dockerfile
+        shell: bash
+        run: |
+          test -f Dockerfile
+          echo "Dockerfile found."
+
+
+  # ============================================================
+  # STAGE 3 - BUILD AND PUSH IMAGE
+  # ============================================================
+  build-and-push:
+    name: Stage 3 - Build and Push Image
+    needs: k8s-validation
+    if: github.event_name == 'push'
+    runs-on: autocare-maintenance
+
+    environment:
+      name: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+
+    outputs:
+      environment: ${{ steps.environment.outputs.environment }}
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: environment
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev)
+              ENVIRONMENT=dev
+              ;;
+            uat)
+              ENVIRONMENT=uat
+              ;;
+            main)
+              ENVIRONMENT=prod
+              ;;
+            *)
+              echo "Unsupported branch: ${GITHUB_REF_NAME}"
+              exit 1
+              ;;
+          esac
+
+          echo "Environment: ${ENVIRONMENT}"
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate immutable image tag
+        id: image
+        shell: bash
+        run: |
+          IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${{ steps.environment.outputs.environment }}-${GITHUB_SHA}"
+
+          echo "Image: ${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: |
+          az acr login --name "$ACR_NAME"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag "${{ steps.image.outputs.image }}" \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push "${{ steps.image.outputs.image }}"
+
+
+  # ============================================================
+  # STAGE 4 - DEPLOY
+  # ============================================================
+  deploy:
+    name: Stage 4 - Deploy to AKS
+    needs: build-and-push
+    runs-on: autocare-maintenance
+
+    environment:
+      name: ${{ needs.build-and-push.outputs.environment }}
+
+    outputs:
+      environment: ${{ needs.build-and-push.outputs.environment }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --overwrite-existing
+
+      - name: Configure kubelogin
+        run: |
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Render Kustomize overlay
+        shell: bash
+        run: |
+          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
+
+          kubectl kustomize \
+            "k8s/overlays/${ENVIRONMENT}" \
+            > /tmp/maintenance-rendered.yaml
+
+      - name: Apply Kubernetes manifests
+        shell: bash
+        run: |
+          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
+
+          kubectl apply \
+            -f /tmp/maintenance-rendered.yaml \
+            -n "${ENVIRONMENT}"
+
+      - name: Set deployed image
+        shell: bash
+        run: |
+          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
+
+          kubectl set image \
+            deployment/autocare-maintenance-service \
+            maintenance-service="${{ needs.build-and-push.outputs.image }}" \
+            -n "${ENVIRONMENT}"
+
+
+  # ============================================================
+  # STAGE 5 - VERIFY
+  # ============================================================
+  verify:
+    name: Stage 5 - Verify
+    needs: deploy
+    runs-on: autocare-maintenance
+
+    environment:
+      name: ${{ needs.deploy.outputs.environment }}
+
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --overwrite-existing
+
+      - name: Configure kubelogin
+        run: |
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status \
+            deployment/autocare-maintenance-service \
+            -n "${{ needs.deploy.outputs.environment }}" \
+            --timeout=5m
+
+      - name: Check deployment
+        run: |
+          kubectl get deployment \
+            autocare-maintenance-service \
+            -n "${{ needs.deploy.outputs.environment }}"
+
+      - name: Check pods
+        run: |
+          kubectl get pods \
+            -n "${{ needs.deploy.outputs.environment }}" \
+            -l app=autocare-maintenance-service
