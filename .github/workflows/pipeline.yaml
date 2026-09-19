@@ -452,7 +452,7 @@ jobs:
           kubectl run \
             maintenance-health-check \
             --rm \
-	    --attach \
+            --attach \
             --restart=Never \
             --image="${ACR_LOGIN_SERVER}/netshoot:latest" \
             --namespace="${ENVIRONMENT}" \
