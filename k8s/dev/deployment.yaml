@@ -12,10 +12,10 @@ spec:
     metadata:
       labels:
         app: autocare-maintenance-service
-    spec:
+    spec: 
       containers:
         - name: maintenance-service
-          image: acrazureproject.azurecr.io/autocare-maintenance-service
+          image: IMAGE_PLACEHOLDER
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
