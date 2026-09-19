@@ -452,8 +452,9 @@ jobs:
           kubectl run \
             maintenance-health-check \
             --rm \
+	    --attach \
             --restart=Never \
-            --image=curlimages/curl:8.16.0 \
+            --image="${ACR_LOGIN_SERVER}/netshoot:latest" \
             --namespace="${ENVIRONMENT}" \
             --command \
             -- curl \
