@@ -7,22 +7,12 @@ on:
       - uat
       - main
 
-  pull_request:
-    branches:
-      - dev
-      - uat
-      - main
-
 permissions:
   contents: read
-  id-token: write
 
-env:
-  ACR_LOGIN_SERVER: acrazureproject.azurecr.io
-  ACR_NAME: acrazureproject
-  IMAGE_NAME: autocare-maintenance-service
-  AZURE_RESOURCE_GROUP: rg-azure-aks
-  AKS_CLUSTER_NAME: aks-azure-project
+defaults:
+  run:
+    shell: bash
 
 jobs:
 
@@ -32,13 +22,21 @@ jobs:
   validate:
     name: Stage 1 - Validate
     runs-on: autocare-maintenance
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    concurrency:
+      group: maintenance-validation-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -63,53 +61,17 @@ jobs:
     name: Stage 2 - Kubernetes Validation
     needs: validate
     runs-on: autocare-maintenance
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Validate DEV Kustomize overlay
-        run: |
-          kubectl kustomize k8s/overlays/dev > /tmp/maintenance-dev.yaml
-
-      - name: Validate UAT Kustomize overlay
-        run: |
-          kubectl kustomize k8s/overlays/uat > /tmp/maintenance-uat.yaml
-
-      - name: Validate PROD Kustomize overlay
-        run: |
-          kubectl kustomize k8s/overlays/prod > /tmp/maintenance-prod.yaml
-
-      - name: Verify Dockerfile
-        shell: bash
-        run: |
-          test -f Dockerfile
-          echo "Dockerfile found."
-
-
-  # ============================================================
-  # STAGE 3 - BUILD AND PUSH IMAGE
-  # ============================================================
-  build-and-push:
-    name: Stage 3 - Build and Push Image
-    needs: k8s-validation
-    if: github.event_name == 'push'
-    runs-on: autocare-maintenance
-
-    environment:
-      name: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
-
-    outputs:
-      environment: ${{ steps.environment.outputs.environment }}
-      image: ${{ steps.image.outputs.image }}
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Determine environment
+      - name: Determine Kubernetes environment
         id: environment
-        shell: bash
         run: |
           case "${GITHUB_REF_NAME}" in
             dev)
@@ -127,38 +89,96 @@ jobs:
               ;;
           esac
 
+          echo "Branch: ${GITHUB_REF_NAME}"
           echo "Environment: ${ENVIRONMENT}"
           echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate immutable image tag
-        id: image
-        shell: bash
+      - name: Validate Kubernetes manifests
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
         run: |
-          IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${{ steps.environment.outputs.environment }}-${GITHUB_SHA}"
+          kubectl apply \
+            --dry-run=client \
+            --validate=true \
+            -f "k8s/${ENVIRONMENT}/" \
+            -n "${ENVIRONMENT}"
 
-          echo "Image: ${IMAGE}"
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Login to Azure Container Registry
+      - name: Verify Dockerfile
         run: |
-          az acr login --name "$ACR_NAME"
+          test -f Dockerfile
+          echo "Dockerfile found."
 
+
+  # ============================================================
+  # STAGE 3 - BUILD IMAGE
+  # ============================================================
+  build-image:
+    name: Stage 3 - Build Image
+    needs: k8s-validation
+    runs-on: autocare-maintenance
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    outputs:
+      environment: ${{ steps.environment.outputs.environment }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Determine environment
+        id: environment
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev)
+              ENVIRONMENT=dev
+              ;;
+            uat)
+              ENVIRONMENT=uat
+              ;;
+            main)
+              ENVIRONMENT=prod
+              ;;
+            *)
+              echo "Unsupported branch: ${GITHUB_REF_NAME}"
+              exit 1
+              ;;
+          esac
+
+          echo "Branch: ${GITHUB_REF_NAME}"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
+      # The build stage intentionally knows nothing about:
+      # - ACR hostname
+      # - ACR name
+      # - application image name
+      # - environment-specific image naming
       - name: Build Docker image
+        env:
+          LOCAL_IMAGE: build-image:${{ github.sha }}
         run: |
           docker build \
-            --tag "${{ steps.image.outputs.image }}" \
+            --tag "${LOCAL_IMAGE}" \
             .
 
-      - name: Push Docker image
+      - name: Save Docker image
+        env:
+          LOCAL_IMAGE: build-image:${{ github.sha }}
+          IMAGE_ARCHIVE: ${{ runner.temp }}/image.tar
         run: |
-          docker push "${{ steps.image.outputs.image }}"
+          docker save \
+            "${LOCAL_IMAGE}" \
+            --output "${IMAGE_ARCHIVE}"
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: docker-image-${{ github.sha }}
+          path: ${{ runner.temp }}/image.tar
+          retention-days: 1
 
 
   # ============================================================
@@ -166,111 +186,283 @@ jobs:
   # ============================================================
   deploy:
     name: Stage 4 - Deploy to AKS
-    needs: build-and-push
+    needs: build-image
     runs-on: autocare-maintenance
+    timeout-minutes: 20
 
+    # This is the ONLY job that references a GitHub Environment.
+    # Therefore this is the ONLY job subject to environment
+    # protection rules and production approval.
     environment:
-      name: ${{ needs.build-and-push.outputs.environment }}
+      name: ${{ needs.build-image.outputs.environment }}
 
-    outputs:
-      environment: ${{ needs.build-and-push.outputs.environment }}
+    concurrency:
+      group: maintenance-deploy-${{ needs.build-image.outputs.environment }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: docker-image-${{ github.sha }}
+          path: ${{ runner.temp }}/image
+
+      - name: Load Docker image
+        env:
+          IMAGE_ARCHIVE: ${{ runner.temp }}/image/image.tar
+        run: |
+          docker load \
+            --input "${IMAGE_ARCHIVE}"
 
       - name: Azure login
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Environment-specific values are intentionally used only
+      # in the deployment stage.
+      - name: Generate full image reference
+        id: image
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
+        run: |
+          IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${ENVIRONMENT}-${GITHUB_SHA}"
+
+          echo "Image: ${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Azure Container Registry
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          az acr login --name "${ACR_NAME}"
+
+      - name: Tag Docker image
+        env:
+          LOCAL_IMAGE: build-image:${{ github.sha }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker tag \
+            "${LOCAL_IMAGE}" \
+            "${IMAGE}"
+
+      - name: Push Docker image
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker push "${IMAGE}"
+
       - name: Get AKS credentials
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           az aks get-credentials \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$AKS_CLUSTER_NAME" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --name "${AKS_CLUSTER_NAME}" \
             --overwrite-existing
 
       - name: Configure kubelogin
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubelogin convert-kubeconfig -l azurecli
 
-      - name: Render Kustomize overlay
-        shell: bash
+      # Copy the environment-specific manifests to a temporary
+      # directory and inject the immutable image reference.
+      - name: Render Kubernetes manifests
+        env:
+          ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
+          IMAGE: ${{ steps.image.outputs.image }}
         run: |
-          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
+          rm -rf "${RUNNER_TEMP}/rendered"
+          mkdir -p "${RUNNER_TEMP}/rendered"
 
-          kubectl kustomize \
-            "k8s/overlays/${ENVIRONMENT}" \
-            > /tmp/maintenance-rendered.yaml
+          cp -R "k8s/${ENVIRONMENT}/." "${RUNNER_TEMP}/rendered/"
 
+          sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+            "${RUNNER_TEMP}/rendered/deployment.yaml"
+
+          echo "Rendered deployment manifest:"
+          cat "${RUNNER_TEMP}/rendered/deployment.yaml"
+
+      # ONE kubectl apply.
+      # No kubectl set image.
       - name: Apply Kubernetes manifests
-        shell: bash
+        env:
+          ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
-          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
-
           kubectl apply \
-            -f /tmp/maintenance-rendered.yaml \
+            -f "${RUNNER_TEMP}/rendered/" \
             -n "${ENVIRONMENT}"
 
-      - name: Set deployed image
-        shell: bash
+      # Wait for the deployment and automatically roll back if
+      # the new revision fails to become ready.
+      - name: Wait for rollout
+        env:
+          ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
-          ENVIRONMENT="${{ needs.build-and-push.outputs.environment }}"
-
-          kubectl set image \
+          if ! kubectl rollout status \
             deployment/autocare-maintenance-service \
-            maintenance-service="${{ needs.build-and-push.outputs.image }}" \
-            -n "${ENVIRONMENT}"
+            -n "${ENVIRONMENT}" \
+            --timeout=5m
+          then
+            echo "Deployment rollout failed."
+            echo "Attempting automatic rollback..."
+
+            kubectl rollout undo \
+              deployment/autocare-maintenance-service \
+              -n "${ENVIRONMENT}"
+
+            kubectl rollout status \
+              deployment/autocare-maintenance-service \
+              -n "${ENVIRONMENT}" \
+              --timeout=5m
+
+            exit 1
+          fi
+
+      - name: Cleanup kubeconfig
+        if: always()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          rm -f "${KUBECONFIG}"
 
 
   # ============================================================
-  # STAGE 5 - VERIFY
+  # STAGE 5 - INDEPENDENT VERIFY
   # ============================================================
   verify:
-    name: Stage 5 - Verify
+    name: Stage 5 - Independent Verify
     needs: deploy
     runs-on: autocare-maintenance
+    timeout-minutes: 10
 
-    environment:
-      name: ${{ needs.deploy.outputs.environment }}
+    # IMPORTANT:
+    # No GitHub Environment here.
+    #
+    # This job authenticates using the branch-based Azure
+    # federated identity credential.
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
+      - name: Determine Kubernetes environment
+        id: environment
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev)
+              ENVIRONMENT=dev
+              ;;
+            uat)
+              ENVIRONMENT=uat
+              ;;
+            main)
+              ENVIRONMENT=prod
+              ;;
+            *)
+              echo "Unsupported branch: ${GITHUB_REF_NAME}"
+              exit 1
+              ;;
+          esac
+
+          echo "Branch: ${GITHUB_REF_NAME}"
+          echo "Environment: ${ENVIRONMENT}"
+          echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
+
       - name: Azure login
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Repository-level variables are intentionally used here.
+      # This keeps Stage 5 independent from the GitHub Environment
+      # used by Stage 4.
       - name: Get AKS credentials
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           az aks get-credentials \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$AKS_CLUSTER_NAME" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --name "${AKS_CLUSTER_NAME}" \
             --overwrite-existing
 
       - name: Configure kubelogin
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubelogin convert-kubeconfig -l azurecli
 
-      - name: Wait for rollout
+      - name: Verify rollout
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubectl rollout status \
             deployment/autocare-maintenance-service \
-            -n "${{ needs.deploy.outputs.environment }}" \
+            -n "${ENVIRONMENT}" \
             --timeout=5m
 
-      - name: Check deployment
+      - name: Verify deployment
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubectl get deployment \
             autocare-maintenance-service \
-            -n "${{ needs.deploy.outputs.environment }}"
+            -n "${ENVIRONMENT}"
 
-      - name: Check pods
+      - name: Verify pods
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubectl get pods \
-            -n "${{ needs.deploy.outputs.environment }}" \
+            -n "${ENVIRONMENT}" \
             -l app=autocare-maintenance-service
+
+      - name: Verify application health
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          kubectl run \
+            maintenance-health-check \
+            --rm \
+            --restart=Never \
+            --image=curlimages/curl:8.16.0 \
+            --namespace="${ENVIRONMENT}" \
+            --command \
+            -- curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              http://autocare-maintenance-service:8001/health
+
+      - name: Cleanup kubeconfig
+        if: always()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          rm -f "${KUBECONFIG}"
