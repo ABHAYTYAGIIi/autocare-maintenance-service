@@ -97,11 +97,13 @@ jobs:
         env:
           ENVIRONMENT: ${{ steps.environment.outputs.environment }}
         run: |
-          kubectl apply \
-            --dry-run=client \
-            --validate=true \
-            -f "k8s/${ENVIRONMENT}/" \
-            -n "${ENVIRONMENT}"
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/work" \
+            --workdir /work \
+            ghcr.io/yannh/kubeconform:v0.8.0 \
+            -strict \
+            -summary \
+            "k8s/${ENVIRONMENT}/"
 
       - name: Verify Dockerfile
         run: |
