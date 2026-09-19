@@ -447,6 +447,7 @@ jobs:
       - name: Verify application health
         env:
           ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           kubectl run \
