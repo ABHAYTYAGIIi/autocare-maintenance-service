@@ -106,15 +106,29 @@ jobs:
             -kubernetes-version 1.35.7 \
             "k8s/${ENVIRONMENT}/"
 
+      - name: Verify environment-specific Kubernetes configuration
+        env:
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+        run: |
+          echo "Checking Kubernetes manifests for environment: ${ENVIRONMENT}"
+
+          if grep -R -nE '^[[:space:]]*namespace:[[:space:]]*(dev|uat|prod)[[:space:]]*$' "k8s/${ENVIRONMENT}" | grep -v "namespace: ${ENVIRONMENT}"; then
+            echo "ERROR: Found a Kubernetes namespace that does not match ${ENVIRONMENT}."
+            exit 1
+          fi
+
+          if [ "${ENVIRONMENT}" != "dev" ] && grep -R -n "namespace: dev" "k8s/${ENVIRONMENT}"; then
+            echo "ERROR: ${ENVIRONMENT} manifests contain namespace: dev."
+            exit 1
+          fi
+
+          echo "Environment-specific Kubernetes configuration is consistent."
+
       - name: Verify Dockerfile
         run: |
           test -f Dockerfile
           echo "Dockerfile found."
 
-
-  # ============================================================
-  # STAGE 3 - BUILD IMAGE
-  # ============================================================
   build-image:
     name: Stage 3 - Build Image
     needs: k8s-validation
