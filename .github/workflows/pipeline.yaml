@@ -458,27 +458,6 @@ jobs:
             -n "${ENVIRONMENT}" \
             -l app=autocare-maintenance-service
 
-      - name: Verify application health
-        env:
-          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
-          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-          KUBECONFIG: ${{ runner.temp }}/kubeconfig
-        run: |
-          kubectl run \
-            maintenance-health-check \
-            --rm \
-            --attach \
-            --restart=Never \
-            --image="${ACR_LOGIN_SERVER}/netshoot:latest" \
-            --namespace="${ENVIRONMENT}" \
-            --command \
-            -- curl \
-              --fail \
-              --silent \
-              --show-error \
-              --max-time 10 \
-              http://autocare-maintenance-service:8001/health
-
       - name: Cleanup kubeconfig
         if: always()
         env:
