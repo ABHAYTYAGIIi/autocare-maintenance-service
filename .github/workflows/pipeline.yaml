@@ -103,7 +103,7 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0 \
             -strict \
             -summary \
-            -kubernetes-version 1.35.7 \
+            -kubernetes-version 1.35.8 \
             "k8s/${ENVIRONMENT}/"
 
       - name: Verify environment-specific Kubernetes configuration
