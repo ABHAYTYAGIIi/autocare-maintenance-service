@@ -4,7 +4,7 @@ metadata:
   name: autocare-maintenance-service
   namespace: prod
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: autocare-maintenance-service

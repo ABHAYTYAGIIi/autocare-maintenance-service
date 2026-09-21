@@ -9,7 +9,7 @@ spec:
     kind: Deployment
     name: autocare-maintenance-service
   minReplicas: 1
-  maxReplicas: 3
+  maxReplicas: 7
   metrics:
     - type: Resource
       resource:
