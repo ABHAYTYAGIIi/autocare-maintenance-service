@@ -1,3 +1,4 @@
+# Promotion merge-resolution marker: main history incorporated before UAT promotion.
 name: AutoCare Maintenance CI/CD
 
 on:
