@@ -52,6 +52,18 @@ jobs:
         run: |
           python -c "from app.main import app; print(app.title)"
 
+      # If SonarQube Cloud Automatic Analysis is enabled for this project,
+      # disable it manually before the first CI analysis.
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=app
+
 
   # ============================================================
   # STAGE 2 - KUBERNETES VALIDATION
@@ -125,6 +137,7 @@ jobs:
 
     outputs:
       environment: ${{ steps.environment.outputs.environment }}
+      image: ${{ steps.image.outputs.image }}
 
     steps:
       - name: Checkout source
@@ -139,11 +152,18 @@ jobs:
           echo "Environment: ${ENVIRONMENT}"
           echo "environment=${ENVIRONMENT}" >> "$GITHUB_OUTPUT"
 
-      # The build stage intentionally knows nothing about:
-      # - ACR hostname
-      # - ACR name
-      # - application image name
-      # - environment-specific image naming
+      - name: Generate full image reference
+        id: image
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          ENVIRONMENT: ${{ steps.environment.outputs.environment }}
+        run: |
+          IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${ENVIRONMENT}-${GITHUB_SHA}"
+
+          echo "Image: ${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
       - name: Build Docker image
         env:
           LOCAL_IMAGE: build-image:${{ github.sha }}
@@ -152,13 +172,32 @@ jobs:
             --tag "${LOCAL_IMAGE}" \
             .
 
-      - name: Save Docker image
+      - name: Tag image for deployment
         env:
           LOCAL_IMAGE: build-image:${{ github.sha }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker tag \
+            "${LOCAL_IMAGE}" \
+            "${IMAGE}"
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ steps.image.outputs.image }}
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'os,library'
+          ignore-unfixed: 'true'
+          exit-code: '1'
+
+      - name: Save Docker image
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
           IMAGE_ARCHIVE: ${{ runner.temp }}/image.tar
         run: |
           docker save \
-            "${LOCAL_IMAGE}" \
+            "${IMAGE}" \
             --output "${IMAGE_ARCHIVE}"
 
       - name: Upload Docker image artifact
@@ -214,38 +253,15 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Environment-specific values are intentionally used only
-      # in the deployment stage.
-      - name: Generate full image reference
-        id: image
-        env:
-          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
-          ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
-        run: |
-          IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${ENVIRONMENT}-${GITHUB_SHA}"
-
-          echo "Image: ${IMAGE}"
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-
       - name: Login to Azure Container Registry
         env:
           ACR_NAME: ${{ vars.ACR_NAME }}
         run: |
           az acr login --name "${ACR_NAME}"
 
-      - name: Tag Docker image
-        env:
-          LOCAL_IMAGE: build-image:${{ github.sha }}
-          IMAGE: ${{ steps.image.outputs.image }}
-        run: |
-          docker tag \
-            "${LOCAL_IMAGE}" \
-            "${IMAGE}"
-
       - name: Push Docker image
         env:
-          IMAGE: ${{ steps.image.outputs.image }}
+          IMAGE: ${{ needs.build-image.outputs.image }}
         run: |
           docker push "${IMAGE}"
 
@@ -263,7 +279,7 @@ jobs:
       - name: Render Kubernetes manifests
         env:
           ENVIRONMENT: ${{ needs.build-image.outputs.environment }}
-          IMAGE: ${{ steps.image.outputs.image }}
+          IMAGE: ${{ needs.build-image.outputs.image }}
         run: |
           rm -rf "${RUNNER_TEMP}/rendered"
           mkdir -p "${RUNNER_TEMP}/rendered"
